@@ -25,7 +25,6 @@ BLOB_CONNECTION_STRING = os.environ.get("BLOB_CONNECTION_STRING")
 # Initialize Blob Service Client
 blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
 
-# JWT Token Decorator
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -33,16 +32,23 @@ def token_required(f):
         if not token:
             return jsonify({'message': 'Token is missing!'}), 401
         try:
+            # Specify algorithms parameter for decoding
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
             current_user = data['user']
-        except Exception as e:
+        except jwt.ExpiredSignatureError:
+            return jsonify({'message': 'Token has expired!'}), 401
+        except jwt.InvalidTokenError:
             return jsonify({'message': 'Token is invalid!'}), 401
         return f(current_user, *args, **kwargs)
     return decorated
 
+
+
+
 @app.route('/')
 def home():
-    return "Backend with Enhanced Features is running!"
+    return "Video Sharing Backend API is running!", 200
+
 
 # User Signup
 @app.route('/signup', methods=['POST'])
@@ -52,6 +58,9 @@ def signup():
     email = data.get('email')
     password = data.get('password')
     role = data.get('role', 'consumer')
+
+    if not username or not email or not password:
+        return jsonify({'error': 'All fields are required!'}), 400
 
     if role not in ['creator', 'consumer']:
         return jsonify({'error': 'Invalid role specified!'}), 400
@@ -66,15 +75,20 @@ def signup():
         conn.commit()
         conn.close()
         return jsonify({'message': 'User registered successfully!'}), 201
+    except pyodbc.IntegrityError as e:
+        return jsonify({'error': 'Email already exists!'}), 409
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# User Login
+
 @app.route('/login', methods=['POST'])
 def login():
     data = request.json
     email = data.get('email')
     password = data.get('password')
+
+    if not email or not password:
+        return jsonify({'error': 'Email and password are required!'}), 400
 
     try:
         conn = pyodbc.connect(SQL_CONNECTION_STRING)
@@ -84,46 +98,22 @@ def login():
         conn.close()
 
         if not row or not bcrypt.checkpw(password.encode('utf-8'), row[2].encode('utf-8')):
-            return jsonify({'message': 'Invalid email or password!'}), 401
+            return jsonify({'error': 'Invalid email or password!'}), 401
 
-        token = jwt.encode({'user': {'id': row[0], 'username': row[1], 'role': row[3]},
-                            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)},
-                           app.config['SECRET_KEY'], algorithm="HS256")
+        # Token generation
+        token = jwt.encode(
+            {
+                'user': {'id': row[0], 'username': row[1], 'role': row[3]},
+                'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            },
+            app.config['SECRET_KEY'],
+            algorithm="HS256"
+        )
         return jsonify({'token': token}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Upload file to Azure Blob Storage (Creator Only)
-@app.route('/upload', methods=['POST'])
-@token_required
-def upload_file(current_user):
-    if current_user['role'] != 'creator':
-        return jsonify({'message': 'Unauthorized access!'}), 403
 
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
-
-    file = request.files['file']
-    blob_name = file.filename
-
-    try:
-        # Get the container client
-        container_client = blob_service_client.get_container_client("videos")
-
-        # Upload the file
-        container_client.upload_blob(blob_name, file, overwrite=True)
-
-        # Save metadata to SQL
-        conn = pyodbc.connect(SQL_CONNECTION_STRING)
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO Videos (title, filepath, uploaded_by) VALUES (?, ?, ?)",
-                       (blob_name, blob_name, current_user['id']))
-        conn.commit()
-        conn.close()
-
-        return jsonify({'message': f"File '{blob_name}' uploaded successfully!"}), 201
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 # List all videos with pagination
 @app.route('/videos', methods=['GET'])
@@ -263,6 +253,15 @@ def delete_video(current_user, video_id):
         return jsonify({'message': 'Video deleted successfully!'}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+# Error Handling Decorators
+@app.errorhandler(404)
+def resource_not_found(e):
+    return jsonify({'error': 'Resource not found!'}), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({'error': 'An internal server error occurred!'}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
