@@ -5,15 +5,15 @@ from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPerm
 from dotenv import load_dotenv
 import os
 import bcrypt
-import jwt
+import jwt  # PyJWT library
 import datetime
 from functools import wraps
-
+from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 # Load environment variables from .env file
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "https://white-field-071dfd20f.4.azurestaticapps.net"}})
+CORS(app)
 
 # Secret key for JWT
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your_secret_key')
@@ -37,12 +37,13 @@ def token_required(f):
             # Specify algorithms parameter for decoding
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
             current_user = data['user']
-        except jwt.ExpiredSignatureError:
+        except ExpiredSignatureError:
             return jsonify({'message': 'Token has expired!'}), 401
-        except jwt.InvalidTokenError:
+        except InvalidTokenError:
             return jsonify({'message': 'Token is invalid!'}), 401
         return f(current_user, *args, **kwargs)
     return decorated
+
 
 
 
