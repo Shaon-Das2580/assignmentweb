@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 import pyodbc
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 from dotenv import load_dotenv
@@ -12,7 +13,7 @@ from functools import wraps
 load_dotenv()
 
 app = Flask(__name__)
-
+CORS(app)
 # Secret key for JWT
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your_secret_key')
 
@@ -115,23 +116,8 @@ def login():
 
 
 
-# List all videos with pagination
-@app.route('/videos', methods=['GET'])
-def list_videos():
-    page = int(request.args.get('page', 1))
-    limit = int(request.args.get('limit', 10))
-    offset = (page - 1) * limit
 
-    try:
-        conn = pyodbc.connect(SQL_CONNECTION_STRING)
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, title, filepath, upload_date FROM Videos ORDER BY upload_date DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", (offset, limit))
-        rows = cursor.fetchall()
-        videos = [{'id': row[0], 'title': row[1], 'filepath': row[2], 'upload_date': row[3]} for row in rows]
-        conn.close()
-        return jsonify(videos), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+
 
 # Generate pre-signed URL for video playback
 @app.route('/videos/<int:video_id>/play', methods=['GET'])
@@ -146,20 +132,24 @@ def get_video_url(video_id):
         if not row:
             return jsonify({'error': 'Video not found!'}), 404
 
-        filepath = row[0]
+        filepath = row[0]  # Example: "4/filename.mov"
+        print(f"Generating SAS for filepath: {filepath}")
+
         sas_token = generate_blob_sas(
             account_name=blob_service_client.account_name,
             container_name="videos",
-            blob_name=filepath,
+            blob_name=filepath,  # Ensure no leading slashes
             account_key=blob_service_client.credential.account_key,
             permission=BlobSasPermissions(read=True),
             expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=1)
         )
 
-        url = f"{blob_service_client.primary_endpoint}/videos/{filepath}?{sas_token}"
+        url = f"{blob_service_client.primary_endpoint}videos/{filepath}?{sas_token}"
         return jsonify({'url': url}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
 
 # Add comments to a video
 @app.route('/videos/<int:video_id>/comments', methods=['POST'])
@@ -176,6 +166,23 @@ def add_comment(current_user, video_id):
         conn.commit()
         conn.close()
         return jsonify({'message': 'Comment added successfully!'}), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+@app.route('/videos/<int:video_id>/comments', methods=['GET'])
+def get_comments(video_id):
+    try:
+        conn = pyodbc.connect(SQL_CONNECTION_STRING)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.comment, u.username
+            FROM Comments c
+            JOIN Users u ON c.user_id = u.id
+            WHERE c.video_id = ?
+        """, (video_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        comments = [{'comment': row[0], 'user': {'username': row[1]}} for row in rows]
+        return jsonify(comments), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -217,42 +224,132 @@ def update_video(current_user, video_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/videos/<int:video_id>/rate', methods=['POST'])
+@app.route('/videos/<int:video_id>/rate', methods=['POST', 'GET'])
 @token_required
 def rate_video(current_user, video_id):
-    data = request.json
-    rating = data.get('rating')
-    if not (1 <= rating <= 5):
-        return jsonify({'error': 'Invalid rating value'}), 400
-    try:
-        conn = pyodbc.connect(SQL_CONNECTION_STRING)
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO Ratings (video_id, user_id, rating) VALUES (?, ?, ?)", (video_id, current_user['id'], rating))
-        conn.commit()
-        conn.close()
-        return jsonify({'message': 'Rating added successfully!'}), 201
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    if request.method == 'POST':
+        data = request.json
+        rating = data.get('rating')
+        if not (1 <= rating <= 5):
+            return jsonify({'error': 'Invalid rating value'}), 400
+
+        try:
+            conn = pyodbc.connect(SQL_CONNECTION_STRING)
+            cursor = conn.cursor()
+
+            # Check if the user has already rated this video
+            cursor.execute("SELECT id FROM Ratings WHERE video_id = ? AND user_id = ?", (video_id, current_user['id']))
+            existing_rating = cursor.fetchone()
+
+            if existing_rating:
+                # Update the existing rating
+                cursor.execute(
+                    "UPDATE Ratings SET rating = ?, rated_at = GETDATE() WHERE id = ?",
+                    (rating, existing_rating[0])
+                )
+            else:
+                # Add a new rating
+                cursor.execute(
+                    "INSERT INTO Ratings (video_id, user_id, rating) VALUES (?, ?, ?)",
+                    (video_id, current_user['id'], rating)
+                )
+
+            # Calculate the average rating
+            cursor.execute("SELECT AVG(rating) FROM Ratings WHERE video_id = ?", (video_id,))
+            avg_rating = cursor.fetchone()[0]
+
+            conn.commit()
+            conn.close()
+
+            return jsonify({'message': 'Rating submitted successfully!', 'averageRating': avg_rating}), 201
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    elif request.method == 'GET':
+        try:
+            conn = pyodbc.connect(SQL_CONNECTION_STRING)
+            cursor = conn.cursor()
+
+            # Get the average rating
+            cursor.execute("SELECT AVG(rating) FROM Ratings WHERE video_id = ?", (video_id,))
+            avg_rating = cursor.fetchone()[0] or 0
+
+            # Get the user's specific rating
+            cursor.execute("SELECT rating FROM Ratings WHERE video_id = ? AND user_id = ?", (video_id, current_user['id']))
+            user_rating = cursor.fetchone()
+            user_rating = user_rating[0] if user_rating else 0
+
+            conn.close()
+            return jsonify({'averageRating': avg_rating, 'userRating': user_rating}), 200
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
 
 @app.route('/videos/<int:video_id>', methods=['DELETE'])
 @token_required
 def delete_video(current_user, video_id):
-    if current_user['role'] != 'creator':
+    if current_user['role'] != 'creator':  # Only creators can delete
         return jsonify({'message': 'Unauthorized access!'}), 403
     try:
         conn = pyodbc.connect(SQL_CONNECTION_STRING)
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM Videos WHERE id = ? AND uploaded_by = ?", (video_id, current_user['id']))
+
+        # Ensure the video belongs to the current creator
+        cursor.execute("SELECT filepath FROM Videos WHERE id = ? AND uploaded_by = ?", (video_id, current_user['id']))
+        row = cursor.fetchone()
+
+        if not row:
+            return jsonify({'error': 'Video not found or not authorized to delete!'}), 404
+
+        filepath = row[0]
+
+        # Delete video from the database
+        cursor.execute("DELETE FROM Videos WHERE id = ?", (video_id,))
         conn.commit()
-        conn.close()
 
-        # Delete video from Blob Storage
+        # Delete video from Azure Blob Storage
         container_client = blob_service_client.get_container_client("videos")
-        container_client.delete_blob(blob_name=str(video_id))
+        container_client.delete_blob(blob_name=filepath)
 
+        conn.close()
         return jsonify({'message': 'Video deleted successfully!'}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/upload', methods=['POST'])
+@token_required
+def upload_video(current_user):
+    if current_user['role'] != 'creator':
+        return jsonify({'message': 'Unauthorized access! Only creators can upload videos.'}), 403
+
+    try:
+        # Retrieve form data
+        title = request.form['title']
+        description = request.form.get('description', '')
+        file = request.files['file']
+
+        if not file:
+            return jsonify({'error': 'No file provided!'}), 400
+
+        # Save the file to Azure Blob Storage
+        container_client = blob_service_client.get_container_client("videos")
+        blob_name = f"{current_user['id']}/{file.filename}"
+        container_client.upload_blob(blob_name, file, overwrite=True)
+
+        # Save video metadata in the database
+        conn = pyodbc.connect(SQL_CONNECTION_STRING)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO Videos (title, description, filepath, uploaded_by, metadata) VALUES (?, ?, ?, ?, ?)",
+            (title, description, blob_name, current_user['id'], '{"tags": []}')
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({'message': 'Video uploaded successfully!'}), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # Error Handling Decorators
 @app.errorhandler(404)
 def resource_not_found(e):
@@ -262,6 +359,29 @@ def resource_not_found(e):
 @app.errorhandler(500)
 def server_error(e):
     return jsonify({'error': 'An internal server error occurred!'}), 500
+
+
+@app.route('/videos', methods=['GET'])
+def list_videos():
+    query = request.args.get('q', '')
+    try:
+        conn = pyodbc.connect(SQL_CONNECTION_STRING)
+        cursor = conn.cursor()
+        if query:
+            cursor.execute(
+                "SELECT id, title, filepath, upload_date FROM Videos WHERE title LIKE ? OR metadata LIKE ?",
+                (f"%{query}%", f"%{query}%")
+            )
+        else:
+            cursor.execute(
+                "SELECT id, title, filepath, upload_date FROM Videos ORDER BY upload_date DESC"
+            )
+        rows = cursor.fetchall()
+        videos = [{'id': row[0], 'title': row[1], 'filepath': row[2], 'upload_date': row[3]} for row in rows]
+        conn.close()
+        return jsonify(videos), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
